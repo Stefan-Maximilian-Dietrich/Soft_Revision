@@ -1,0 +1,147 @@
+# ============================================================
+# Import der Bibliotheken
+# ============================================================
+import urllib.request  # Lädt den Iris-Datensatz direkt aus dem Internet
+import io              # Macht aus geladenen Bytes/String ein Dateiobjekt
+import pandas as pd    # Zum Einlesen und Bearbeiten des CSV-Datensatzes
+import numpy as np     # N-dimensionale Arrays und numerische Operationen
+import torch           # Hauptpaket von PyTorch: Tensors, Training, GPU
+from torch import nn   # Bausteine für neuronale Netze (Layer, Loss etc.)
+from torch.utils.data import TensorDataset, DataLoader  # Daten für Training/Test verwalten
+from sklearn.model_selection import train_test_split    # Train/Test-Split
+from sklearn.preprocessing import StandardScaler        # Daten normalisieren
+from sklearn.metrics import confusion_matrix, classification_report  # Auswertung
+
+# ============================================================
+# 1) Iris-Datensatz laden
+# ------------------------------------------------------------
+# UCI Machine Learning Repository hat den Datensatz im CSV-Format.
+# Wir holen ihn als Text und lesen ihn mit pandas ein.
+# ============================================================
+URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/iris/iris.data"
+cols = ["sepal_length", "sepal_width", "petal_length", "petal_width", "species"]
+
+with urllib.request.urlopen(URL) as resp:      # Download
+    raw = resp.read().decode("utf-8")          # Bytes -> String
+
+df = pd.read_csv(io.StringIO(raw), header=None, names=cols)  # CSV in DataFrame
+df = df.dropna()  # Falls leere Zeilen vorhanden sind
+
+print(df)
+
+print("Load Done")
+# ============================================================
+# 2) Labels in Zahlen umwandeln (Mapping)
+# ------------------------------------------------------------
+# PyTorch kann nicht direkt mit Strings als Zielvariable arbeiten.
+# Wir mappen daher Klassennamen auf ganze Zahlen.
+# ============================================================
+label_map = {name: i for i, name in enumerate(sorted(df["species"].unique()))}
+y = df["species"].map(label_map).to_numpy().astype(np.int64)   # Labels als Integer
+X = df.drop(columns=["species"]).to_numpy().astype(np.float32) # Features als float32
+print("Mapping Done")
+
+# ============================================================
+# 3) Train/Test-Split + Standardisierung
+# ------------------------------------------------------------
+# Wir teilen den Datensatz auf und normalisieren die Eingaben.
+# StandardScaler bringt alle Merkmale auf gleiche Skala.
+# ============================================================
+X_train, X_test, y_train, y_test = train_test_split(X, y, train_size= 0.1, random_state=42, stratify=y)
+scaler = StandardScaler().fit(X_train)
+X_train = scaler.transform(X_train).astype(np.float32)
+X_test  = scaler.transform(X_test).astype(np.float32)
+
+print("n train: " , len(y_train))
+# ============================================================
+# 4) TensorDataset + DataLoader
+# ------------------------------------------------------------
+# TensorDataset = verpackt X und y zu einem Datensatz
+# DataLoader = erzeugt Mini-Batches und mischt Daten
+# ============================================================
+train_ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
+test_ds  = TensorDataset(torch.from_numpy(X_test),  torch.from_numpy(y_test))
+train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
+test_loader  = DataLoader(test_ds, batch_size=64)
+
+# ============================================================
+# 5) Modellarchitektur (MLP)
+# ------------------------------------------------------------
+# nn.Sequential = Liste von Layern, die nacheinander ausgeführt werden.
+# Linear = vollverbundene Schicht (Dense Layer).
+# ReLU = Aktivierungsfunktion (führt Nichtlinearität ein).
+# ============================================================
+class MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(4, 16),
+            nn.ReLU(),
+            nn.Linear(16, 8),
+            nn.ReLU(),
+            nn.Linear(8, 3)  # 3 Klassen-Ausgabe
+        )
+    def forward(self, x):
+        return self.net(x)
+
+# ============================================================
+# 6) Gerät auswählen (CPU, GPU, Apple M1/M2 mit MPS)
+# ============================================================
+device = (
+    torch.device("cuda") if torch.cuda.is_available()
+    else (torch.device("mps") if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+          else torch.device("cpu"))
+)
+
+# Modell, Loss und Optimierer definieren
+model = MLP().to(device)
+criterion = nn.CrossEntropyLoss()  # Mehrklassen-Classification
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)  # Optimierer
+
+# ============================================================
+# 7) Training
+# ============================================================
+EPOCHS = 100
+for epoch in range(1, EPOCHS + 1):
+    running_loss = 0.0
+    model.train()
+    for xb, yb in train_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        optimizer.zero_grad()            # Gradienten-Reset
+        logits = model(xb)               # Vorwärtsdurchlauf
+        loss = criterion(logits, yb)     # Loss berechnen
+        loss.backward()                  # Gradienten berechnen
+        optimizer.step()                  # Gewichte updaten
+        running_loss += loss.item() * xb.size(0)
+    if epoch % 20 == 0:
+        print(f"Epoch {epoch:3d} | Loss: {running_loss/len(train_ds):.4f}")
+
+###
+# modell visoalisieren 
+print(model)
+# ============================================================
+# 8) Testen
+# ============================================================
+model.eval()
+all_preds, all_true = [], []
+with torch.no_grad():  # Keine Gradientenberechnung nötig
+    for xb, yb in test_loader:
+        xb = xb.to(device)
+        logits = model(xb)
+        preds = logits.argmax(dim=1).cpu().numpy()
+        all_preds.append(preds)
+        all_true.append(yb.numpy())
+
+y_pred = np.concatenate(all_preds)
+y_true = np.concatenate(all_true)
+
+# ============================================================
+# 9) Auswertung: Konfusionsmatrix + Report
+# ============================================================
+cm = confusion_matrix(y_true, y_pred)
+print("\nConfusion Matrix (rows=true, cols=pred):\n", cm)
+
+inv_label_map = {v: k for k, v in label_map.items()}
+target_names = [inv_label_map[i] for i in range(len(inv_label_map))]
+print("\nClassification Report:\n",
+      classification_report(y_true, y_pred, target_names=target_names))
